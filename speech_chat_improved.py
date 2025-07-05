@@ -88,7 +88,7 @@ class ImprovedSpeechChat:
             return BytesIO(response.read())
             
         except Exception as e:
-            st.error(f"Error in text-to-speech: {e}")
+            st.error(f"Error in text-to-speech : {e}")
             return None
     
     def chat_with_llm(self, user_input):
