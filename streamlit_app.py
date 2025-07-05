@@ -14,8 +14,6 @@ from main import SearchAPIResponse, RedditResult, fetch_reddit_post
 # Load environment variables
 load_dotenv()
 
-# Environment setup
-os.environ["GROQ_API_KEY"] = os.getenv("GROQ_API_KEY")
 
 # Initialize LLM with tools bound
 @st.cache_resource
