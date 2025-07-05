@@ -3,7 +3,7 @@ from typing import Annotated, TypedDict
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_groq import ChatGroq
 import json
 import os
 from dotenv import load_dotenv
@@ -14,15 +14,14 @@ from main import SearchAPIResponse, RedditResult, fetch_reddit_post
 load_dotenv()
 
 # Environment setup
-os.environ["GOOGLE_API_KEY"] = os.getenv("GOOGLE_API_KEY")
+os.environ["GROQ_API_KEY"] = os.getenv("GROQ_API_KEY")
 
 # Initialize LLM
 @st.cache_resource
 def get_llm():
-    return ChatGoogleGenerativeAI(
-        model="gemini-2.0-flash",
-        temperature=0.7
-    )
+    return ChatGroq(
+    model="llama-3.3-70b-versatile",
+)
 
 # State definition
 class BotState(TypedDict):
