@@ -7,6 +7,7 @@ from langchain_groq import ChatGroq
 from langchain_core.tools import tool
 import json
 import os
+import concurrent.futures
 from dotenv import load_dotenv
 from search_cache import get_search_results  # Local caching
 from main import SearchAPIResponse, RedditResult, fetch_reddit_post
@@ -28,6 +29,8 @@ def get_llm():
 class BotState(TypedDict):
     messages: Annotated[list, add_messages]
     content: dict  # Holds product content in JSON format
+
+
 
 # System instruction
 SYS_INSTRUCTION = """You are a shopping assistant helping users find products. 
@@ -72,11 +75,11 @@ def get_content(query: str) -> List[dict]:
         
         product_data = []
         
-        for reddit_result in reddit_results:
-            # Fetch post metadata and top-level comments
+        # Use concurrent processing for faster Reddit post fetching
+        def fetch_single_post(reddit_result):
             try:
                 post = fetch_reddit_post(reddit_result.link)
-                product_data.append({
+                return {
                     "title": post.title,
                     "description": post.description[:200] + ('...' if len(post.description) > 200 else ''),
                     "link": post.link,
@@ -89,20 +92,69 @@ def get_content(query: str) -> List[dict]:
                         }
                         for comment in post.comments[:5]  # Limit to first 5 comments
                     ]
-                })
-            except Exception as exc:
-                continue
+                }
+            except Exception:
+                return None
+        
+        # Limit to first 10 results for better performance
+        limited_results = reddit_results[:10]
+        
+        # Fetch posts concurrently with timeout
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            future_to_result = {executor.submit(fetch_single_post, result): result for result in limited_results}
+            
+            for future in concurrent.futures.as_completed(future_to_result, timeout=30):
+                try:
+                    post_data = future.result()
+                    if post_data:
+                        product_data.append(post_data)
+                except Exception:
+                    continue
         
         return product_data
     except Exception as e:
         return [{"error": f"Failed to fetch content: {str(e)}"}]
 
+def generate_tldr(response_content: str) -> str:
+    """Generate a 2-line TLDR summary of the main response"""
+    try:
+        llm = get_llm()
+        
+        tldr_prompt = f"""Please summarize the following shopping assistant response in exactly 2 lines.
+Make it concise and capture the key recommendations or insights.
+
+Response to summarize:
+{response_content}
+
+TLDR (2 lines):"""
+        
+        tldr_response = llm.invoke([HumanMessage(content=tldr_prompt)])
+        tldr_content = tldr_response.content.strip()
+        
+        # Ensure it's exactly 2 lines
+        lines = tldr_content.split('\n')
+        lines = [line.strip() for line in lines if line.strip()]
+        
+        if len(lines) >= 2:
+            return f"{lines[0]}\n{lines[1]}"
+        elif len(lines) == 1:
+            # If only one line, split it or add a second line
+            if len(lines[0]) > 80:
+                mid_point = lines[0].rfind(' ', 0, 80)
+                if mid_point > 0:
+                    return f"{lines[0][:mid_point]}\n{lines[0][mid_point+1:]}"
+            return f"{lines[0]}\nBased on Reddit discussions and user experiences."
+        else:
+            return "Key insights from Reddit discussions.\nRecommendations based on user experiences."
+    
+    except Exception as e:
+        return "Product recommendations summary.\nBased on Reddit user discussions."
+
 # Node: Generate assistant response
 def generate_response(state: BotState, user_input: str) -> tuple[str, dict]:
     """Generate assistant response using LLM with tool calling capability"""
     
-    # Add user message to state
-    state["messages"].append(HumanMessage(content=user_input))
+    # Note: User message is already added to state by the caller
     
     # Bind tools to LLM
     llm_with_tools = get_llm().bind_tools([get_content])
@@ -124,22 +176,23 @@ def generate_response(state: BotState, user_input: str) -> tuple[str, dict]:
         # Process each tool call
         for tool_call in response.tool_calls:
             if tool_call["name"] == "get_content":
-                # Show spinner while fetching content
-                with st.spinner(f"Fetching product information for: {tool_call['args']['query']}"):
-                    # Execute the tool
-                    tool_result = get_content.invoke(tool_call["args"])
-                    
-                    # Update state content
-                    state["content"] = tool_result
-                    
-                    # Add tool message to state
-                    tool_message = ToolMessage(
-                        content=json.dumps(tool_result),
-                        tool_call_id=tool_call["id"]
-                    )
-                    state["messages"].append(tool_message)
-                    
-                    st.success(f"Fetched {len(tool_result)} Reddit posts for analysis")
+                # Show status while fetching content
+                # st.info(f"🔍 Searching Reddit for: {tool_call['args']['query']}")
+                
+                # Execute the tool
+                tool_result = get_content.invoke(tool_call["args"])
+                
+                # Update state content
+                state["content"] = tool_result
+                
+                # Add tool message to state
+                tool_message = ToolMessage(
+                    content=json.dumps(tool_result),
+                    tool_call_id=tool_call["id"]
+                )
+                state["messages"].append(tool_message)
+                
+                # st.success(f"✅ Found {len(tool_result)} Reddit posts for analysis")
         
         # Get final response after tool execution
         final_response = llm_with_tools.invoke([sys_msg] + state["messages"])
@@ -253,45 +306,56 @@ def main():
         with tab1:
             # Chat interface
             # Display chat messages
-            for message in st.session_state.messages:
+            for i, message in enumerate(st.session_state.messages):
                 if isinstance(message, AIMessage):
                     with st.chat_message("assistant"):
                         st.markdown(message.content)
+                        
+                        # Add TLDR for AI responses (skip welcome message)
+                        if i > 0 and len(message.content) > 200:  # Only for substantial responses
+                            with st.expander("📝 TLDR", expanded=False):
+                                with st.spinner("Generating summary..."):
+                                    tldr = generate_tldr(message.content)
+                                    st.markdown(f"**Quick Summary:**\n\n{tldr}")
                 elif isinstance(message, HumanMessage):
                     with st.chat_message("user"):
                         st.markdown(message.content)
     else:
         # Chat interface (when no content is available)
         # Display chat messages
-        for message in st.session_state.messages:
+        for i, message in enumerate(st.session_state.messages):
             if isinstance(message, AIMessage):
                 with st.chat_message("assistant"):
                     st.markdown(message.content)
+                    
+                    # Add TLDR for AI responses (skip welcome message)
+                    if i > 0 and len(message.content) > 200:  # Only for substantial responses
+                        with st.expander("📝 TLDR", expanded=False):
+                            with st.spinner("Generating summary..."):
+                                tldr = generate_tldr(message.content)
+                                st.markdown(f"**Quick Summary:**\n\n{tldr}")
             elif isinstance(message, HumanMessage):
                 with st.chat_message("user"):
                     st.markdown(message.content)
 
     # Chat input
     if prompt := st.chat_input("What are you looking for today?"):
-        # Display user message
-        with st.chat_message("user"):
-            st.markdown(prompt)
+        # Add user message to session state immediately
+        st.session_state.messages.append(HumanMessage(content=prompt))
+        st.session_state.bot_state["messages"] = st.session_state.messages
         
         # Generate and display assistant response
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                response_content, updated_content = generate_response(
-                    st.session_state.bot_state, 
-                    prompt
-                )
-                
-                # Update session state
-                st.session_state.messages = st.session_state.bot_state["messages"]
-                st.session_state.content = updated_content
-                
-                st.markdown(response_content)
+        with st.spinner("Thinking..."):
+            response_content, updated_content = generate_response(
+                st.session_state.bot_state, 
+                prompt
+            )
+            
+            # Update session state
+            st.session_state.messages = st.session_state.bot_state["messages"]
+            st.session_state.content = updated_content
         
-        # Force rerun to update the chat
+        # Force rerun to update the chat and show the complete conversation
         st.rerun()
 
 if __name__ == "__main__":
